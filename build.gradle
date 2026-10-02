@@ -1,0 +1,371 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot' version '4.1.1'
+    id 'io.spring.dependency-management' version '1.1.7'
+    id "org.openjfx.javafxplugin" version "0.1.0"
+//    id "application"
+}
+
+group = 'de.wedasoft'
+version = '0.0.1'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    javaFxVersion = "25.0.4"
+    javaVersion = 25
+    customTasksGradleGroupName = '_custom tasks (javafx spring boot application)'
+}
+
+dependencies {
+    implementation 'org.springframework.boot:spring-boot-h2console'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation 'org.springframework.boot:spring-boot-starter-webflux'
+
+    compileOnly 'org.projectlombok:lombok'
+    developmentOnly 'org.springframework.boot:spring-boot-devtools'
+    runtimeOnly 'com.h2database:h2'
+
+    annotationProcessor 'org.projectlombok:lombok'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-data-jpa-test'
+    testImplementation 'org.springframework.boot:spring-boot-starter-webflux-test'
+    testCompileOnly 'org.projectlombok:lombok'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+    testAnnotationProcessor 'org.projectlombok:lombok'
+
+    // JavaFX
+    implementation "org.openjfx:javafx-base:${javaFxVersion}:win"
+    implementation "org.openjfx:javafx-base:${javaFxVersion}:linux"
+    implementation "org.openjfx:javafx-base:${javaFxVersion}:mac"
+
+    implementation "org.openjfx:javafx-controls:${javaFxVersion}:win"
+    implementation "org.openjfx:javafx-controls:${javaFxVersion}:linux"
+    implementation "org.openjfx:javafx-controls:${javaFxVersion}:mac"
+
+    implementation "org.openjfx:javafx-graphics:${javaFxVersion}:win"
+    implementation "org.openjfx:javafx-graphics:${javaFxVersion}:linux"
+    implementation "org.openjfx:javafx-graphics:${javaFxVersion}:mac"
+
+    implementation "org.openjfx:javafx-fxml:${javaFxVersion}"
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+//============================================================
+// CUSTOM TASKS
+//============================================================
+
+tasks.register('cleanBuildDir', DefaultTask) {
+    group = "${customTasksGradleGroupName}"
+    dependsOn clean
+}
+
+tasks.register('runJfxSpringBootApp', DefaultTask) {
+    group = "${customTasksGradleGroupName}"
+    dependsOn bootRun
+}
+
+tasks.register('packageAsExecutableJar', DefaultTask) {
+    group = "${customTasksGradleGroupName}"
+    dependsOn cleanBuildDir, bootJar
+    mustRunAfter(cleanBuildDir)
+}
+
+tasks.register('packageAsAppImage', Exec) {
+    group = "${customTasksGradleGroupName}"
+    dependsOn packageAsExecutableJar
+
+    doFirst {
+
+        //====================================================
+        // Validate application version
+        //====================================================
+
+        final boolean validAppVersion = validateAppVersion()
+
+        if (!validAppVersion) {
+            throw new GradleException(
+                    "Application version '${version}' cannot be used as JPackage app-version."
+            )
+        }
+
+        //====================================================
+        // Prepare packaging
+        //====================================================
+
+        final def applicationProperties = loadSpringApplicationProperties()
+        final def mainJar = findAndValidateMainJar()
+        final def outputDir = createAndPrepareJpackageOutputDir()
+        final def appIconFilePath = getAppIconFilePath()
+
+        //====================================================
+        // Determine Java / JPackage executable
+        //====================================================
+
+        final def javaLauncher = javaToolchains.launcherFor {
+            languageVersion = JavaLanguageVersion.of(javaVersion)
+        }.get()
+
+        final File javaHome = javaLauncher.metadata.installationPath.asFile
+        final File javaExecutable = new File(
+                javaHome,
+                "bin/java.exe"
+        )
+
+        final File jPackageExecutable = new File(
+                javaHome,
+                "bin/jpackage.exe"
+        )
+
+        printJavaVersionInfoForJpackage(javaExecutable, jPackageExecutable)
+
+        //====================================================
+        // Validate Java / JPackage executables
+        //====================================================
+
+        if (!javaExecutable.exists()) {
+            throw new GradleException(
+                    "Java executable not found: ${javaExecutable.absolutePath}"
+            )
+        }
+
+        if (!jPackageExecutable.exists()) {
+            throw new GradleException(
+                    "JPackage executable not found: ${jPackageExecutable.absolutePath}"
+            )
+        }
+
+        //====================================================
+        // Create JPackage command
+        //====================================================
+
+        println "Creating JPackage command..."
+
+        ArrayList<String> jPackageCommand = [
+                jPackageExecutable.absolutePath,
+                "--type", "app-image",
+                "--input", new File(getBuildDir(), "libs").toString(),
+                "--main-jar", mainJar.name,
+                "--dest", outputDir.toString(),
+                "--name", (applicationProperties['spring.application.name'] ?: 'DefaultAppName'),
+                "--app-version", version.toString()
+        ]
+
+        // Add icon only if available
+        if (appIconFilePath) {
+            jPackageCommand.addAll([
+                    "--icon", appIconFilePath
+            ])
+        }
+
+        println "\tJPackage command created."
+        println "\tUsed command without double quotes: ${jPackageCommand.join(' ')}"
+
+        //====================================================
+        // Execute JPackage
+        //====================================================
+
+        println "Executing JPackage command via commandLine..."
+
+        commandLine jPackageCommand
+
+        println "\tJPackage command executed."
+        println "Packaging as app image finished."
+        println "\tPackaged app location: " +
+                getBuildDir().toPath().resolve("jpackage").toString()
+    }
+}
+
+//============================================================
+// VALIDATION
+//============================================================
+
+private boolean validateAppVersion() {
+    println "Validating application version..."
+
+    String appVersion = version.toString()
+
+    println "\tApplication version: '${appVersion}'"
+
+    boolean valid = appVersion ==~ /^\d+(\.\d+)*$/
+
+    if (valid) {
+        println "\tValid for JPackage: YES"
+    } else {
+        println "\tValid for JPackage: NO"
+        println "\tReason: JPackage requires numeric version components."
+        println "\tExample: '0.0.1'. SNAPSHOT is not allowed."
+    }
+
+    return valid
+}
+
+//============================================================
+// SPRING BOOT APPLICATION PROPERTIES
+//============================================================
+
+private Properties loadSpringApplicationProperties() {
+    println "Loading Spring Boot application.properties..."
+
+    def applicationProperties = new Properties()
+
+    file('src/main/resources/application.properties').withInputStream {
+        applicationProperties.load(it)
+    }
+
+    println "\tSpring Boot application.properties loaded."
+
+    return applicationProperties
+}
+
+//============================================================
+// MAIN JAR
+//============================================================
+
+private File findAndValidateMainJar() {
+    println "Find and validate main jar..."
+
+    def mainJar = new File(getBuildDir(), "libs")
+            .listFiles()
+            .find { it.name.endsWith('.jar') }
+
+    if (mainJar == null) {
+        throw new GradleException(
+                "No JAR file found in build/libs."
+        )
+    }
+
+    println "\tMain jar found."
+    println "\tPath: ${mainJar.toString()}"
+
+    return mainJar
+}
+
+//============================================================
+// JPACKAGE OUTPUT DIRECTORY
+//============================================================
+
+private File createAndPrepareJpackageOutputDir() {
+    println "Creating and preparing output dir for JPackage app image..."
+
+    File dir = new File(
+            getBuildDir(),
+            "jpackage"
+    )
+
+    if (dir.exists()) {
+        dir.deleteDir()
+    }
+
+    dir.mkdirs()
+
+    println "\tOutput dir created."
+    println "\tPath: ${dir.toString()}"
+
+    return dir
+}
+
+//============================================================
+// APPLICATION ICON
+//============================================================
+
+private String getAppIconFilePath() {
+    println "Loading app icon..."
+    println "\tHint: Use '.ico' as preferred file format. Other formats may not be supported correctly."
+
+    final String resourcePath =
+            "src/main/resources/assets/app-icon.ico"
+
+    File file = project.file(resourcePath) as File
+
+    if (!file.exists() || !file.isFile()) {
+        println "\tWARN: No app icon file found at path: '${file.getCanonicalPath()}'."
+        println "\tWARN: App icon is not used."
+
+        return ""
+    }
+
+    println "\tApp icon loaded."
+    println "\tPath: ${file.getCanonicalPath()}"
+
+    return file.getCanonicalPath()
+}
+
+//============================================================
+// BUILD DIRECTORY
+//============================================================
+
+private File getBuildDir() {
+    return layout
+            .getBuildDirectory()
+            .getAsFile()
+            .get() as File
+}
+
+//============================================================
+// JAVA / JPACKAGE VERSION
+//============================================================
+
+private void printJavaVersionInfoForJpackage(
+        File javaExecutable,
+        File jPackageExecutable
+) {
+    println "Determining Java version for using JPackage..."
+
+    println "\tJava executable:"
+    println "\t${javaExecutable.absolutePath}"
+
+    println "\tJPackage executable:"
+    println "\t${jPackageExecutable.absolutePath}"
+
+    def javaProcess = new ProcessBuilder(
+            javaExecutable.absolutePath,
+            "--version"
+    )
+            .redirectErrorStream(true)
+            .start()
+
+    def javaOutput = javaProcess.inputStream.text
+
+    javaProcess.waitFor()
+
+    println "\tJava version determined via Gradle Java Toolchain:"
+
+    javaOutput
+            .readLines()
+            .findAll { !it.isBlank() }
+            .each {
+                println "\t${it}"
+            }
+
+    def jPackageProcess = new ProcessBuilder(
+            jPackageExecutable.absolutePath,
+            "--version"
+    )
+            .redirectErrorStream(true)
+            .start()
+
+    def jPackageOutput = jPackageProcess.inputStream.text
+
+    jPackageProcess.waitFor()
+
+    println "\tJPackage version:"
+
+    jPackageOutput
+            .readLines()
+            .findAll { !it.isBlank() }
+            .each {
+                println "\t${it}"
+            }
+}
